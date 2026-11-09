@@ -1,0 +1,218 @@
+"""Merge one or more online TXT channel lists into an extended M3U playlist."""
+from pathlib import Path
+import sys
+import time
+from urllib.request import Request, urlopen
+from urllib.parse import urlsplit
+
+MAX_BYTES = 10 * 1024 * 1024
+SCHEMES = {"http", "https", "rtsp", "rtmp", "rtmps", "udp", "rtp"}
+
+
+def is_html(text):
+    return text.lstrip().lower().startswith(("<!doctype html", "<html", "<script"))
+
+
+def decode_source(data):
+    if data.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return data.decode("utf-16")
+    for encoding in ("utf-8-sig", "gb18030"):
+        try:
+            return data.decode(encoding)
+        except UnicodeDecodeError:
+            pass
+    raise ValueError("Unsupported text encoding")
+
+
+def convert(text):
+    if is_html(text):
+        raise ValueError("Source returned an HTML page instead of a channel list")
+    if text.lstrip().startswith("#EXTM3U"):
+        raise ValueError("Source is already M3U; this converter expects TXT")
+    result = ["#EXTM3U"]
+    group = ""
+    count = 0
+    skipped = 0
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        name, separator, address = line.partition(",")
+        name, address = name.strip(), address.strip()
+        if not separator:
+            skipped += 1
+            continue
+        if address.casefold() == "#genre#":
+            group = name
+            continue
+        try:
+            valid = urlsplit(address).scheme.lower() in SCHEMES
+        except ValueError:
+            valid = False
+        if not name or not valid:
+            skipped += 1
+            continue
+        # Quotes inside a group name would break the M3U attribute syntax.
+        safe_group = group.replace('"', "'")
+        attribute = f' group-title="{safe_group}"' if group else ""
+        result.extend((f"#EXTINF:-1{attribute},{name}", address))
+        count += 1
+    if not count:
+        raise ValueError("No valid channels found; existing output is preserved")
+    return "\n".join(result) + "\n", count, skipped
+
+
+def fetch_http(url):
+    if urlsplit(url).scheme.lower() not in {"http", "https"}:
+        raise ValueError("Source must be an HTTP or HTTPS URL")
+    for attempt in range(3):
+        try:
+            request = Request(url, headers={"User-Agent": "Mozilla/5.0 TXT-to-M3U"})
+            with urlopen(request, timeout=45) as response:
+                data = response.read(MAX_BYTES + 1)
+            if len(data) > MAX_BYTES:
+                raise ValueError("Source exceeds 10 MiB")
+            return decode_source(data)
+        except Exception:
+            if attempt == 2:
+                # Do not include a potentially private subscription URL in logs.
+                raise RuntimeError("Unable to fetch/decode TXT source after 3 attempts") from None
+            time.sleep(2 * (attempt + 1))
+
+
+def fetch_browser(url):
+    """Read the rendered text through an ordinary, isolated Chromium session.
+
+    No stored cookies, stealth flags, fingerprint changes, or CAPTCHA solving.
+    """
+    from playwright.sync_api import sync_playwright
+
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True)
+        try:
+            page = browser.new_page()
+            page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline:
+                try:
+                    # Browser text viewers normally put a text/plain file in PRE.
+                    viewer = page.locator("pre")
+                    if viewer.count() == 1:
+                        text = viewer.inner_text(timeout=2000)
+                        if len(text.encode("utf-8")) > MAX_BYTES:
+                            raise ValueError("Rendered source exceeds 10 MiB")
+                        convert(text)
+                        return text
+                    body = page.locator("body").inner_text(timeout=2000).lower()
+                    if any(marker in body for marker in (
+                        "verify you are human", "complete the captcha", "access denied"
+                    )):
+                        raise RuntimeError("Browser access requires manual verification or was denied")
+                except ValueError:
+                    raise
+                except RuntimeError:
+                    raise
+                except Exception:
+                    # An automatic page navigation can replace the document.
+                    pass
+                page.wait_for_timeout(500)
+            raise RuntimeError("Browser did not return a valid plain-text playlist")
+        finally:
+            browser.close()
+
+
+def fetch(url):
+    if urlsplit(url).scheme.lower() not in {"http", "https"}:
+        raise ValueError("Source must be an HTTP or HTTPS URL")
+    try:
+        text = fetch_http(url)
+    except Exception:
+        print("HTTP fetch failed; trying normal browser loading")
+    else:
+        if not is_html(text):
+            return text
+        print("HTTP returned HTML; trying normal browser loading")
+    try:
+        return fetch_browser(url)
+    except Exception:
+        raise RuntimeError(
+            "Browser loading failed or access was restricted; existing output is preserved. "
+            "Check that Playwright/Chromium are installed, or use an accessible TXT mirror."
+        ) from None
+
+
+def parse_source_urls(value):
+    urls = []
+    seen = set()
+    for line in value.splitlines():
+        url = line.strip()
+        if not url or url.startswith("#"):
+            continue
+        try:
+            parsed = urlsplit(url)
+            valid = parsed.scheme.lower() in {"http", "https"} and bool(parsed.netloc)
+            valid = valid and not any(character.isspace() for character in url)
+        except ValueError:
+            valid = False
+        if not valid:
+            raise ValueError("url.txt must contain one complete HTTP/HTTPS URL per line")
+        if url not in seen:
+            urls.append(url)
+            seen.add(url)
+    if not urls:
+        raise ValueError("Add at least one HTTP/HTTPS source URL to url.txt")
+    return urls
+
+
+def merge_sources(urls):
+    result = ["#EXTM3U"]
+    seen = set()
+    skipped = duplicates = 0
+    for index, url in enumerate(urls, start=1):
+        print(f"Loading source {index}/{len(urls)}")
+        try:
+            playlist, count, source_skipped = convert(fetch(url))
+        except Exception as exc:
+            raise RuntimeError(
+                f"Source {index}/{len(urls)} failed: {exc}. "
+                "No partial playlist was published; previous output is preserved"
+            ) from None
+        skipped += source_skipped
+        lines = playlist.splitlines()[1:]
+        for offset in range(0, len(lines), 2):
+            entry = (lines[offset], lines[offset + 1])
+            if entry in seen:
+                duplicates += 1
+                continue
+            seen.add(entry)
+            result.extend(entry)
+        print(f"Source {index}/{len(urls)}: parsed {count} channels")
+    return "\n".join(result) + "\n", len(seen), skipped, duplicates
+
+
+def main():
+    source_file = Path(__file__).resolve().with_name("url.txt")
+    try:
+        source_text = source_file.read_text(encoding="utf-8-sig")
+    except FileNotFoundError:
+        raise ValueError("url.txt not found; create it next to convert.py") from None
+    except UnicodeError:
+        raise ValueError("Save url.txt using UTF-8 encoding") from None
+    urls = parse_source_urls(source_text)
+    output, count, skipped, duplicates = merge_sources(urls)
+    destination = source_file.with_name("live.m3u")
+    temporary = destination.with_suffix(".m3u.tmp")
+    temporary.write_text(output, encoding="utf-8")
+    temporary.replace(destination)
+    print(
+        f"Generated {count} channels from {len(urls)} sources; "
+        f"skipped {skipped} unrecognized lines; removed {duplicates} exact duplicates"
+    )
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as exc:
+        print(f"Conversion failed: {exc}", file=sys.stderr)
+        sys.exit(1)

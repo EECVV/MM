@@ -1,0 +1,5 @@
+# 每行一个完整的 TXT 订阅网址；空行和以 # 开头的备注会被忽略。
+# 下面沿用原 README 中已有的网址，请按需替换或继续添加来源。
+https://jk.html-5.me/i/03537.txt
+https://jk.html-5.me/i/converted_20260812T012104.txt
+https://jk.html-5.me/i/黄果搞定.txt
